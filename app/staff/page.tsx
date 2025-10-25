@@ -336,3 +336,12 @@ export default function StaffPage() {
     </div>
   );
 }
+export default function StaffPage() {
+  return (
+    <div style={{ textAlign: "center", padding: "40px" }}>
+      <h1>🍜 シフト管理アプリ（テスト表示）</h1>
+      <p>このページが更新されたら、公開URLにも反映されます。</p>
+    </div>
+  );
+}
+
