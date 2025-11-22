@@ -1,0 +1,256 @@
+import { NextResponse } from "next/server";
+import { prisma } from "../../../lib/prisma";
+
+const SLOT: Record<string,{start:string,end:string}> = {
+  "06-14": { start:"06:00", end:"14:00" },
+  "14-23": { start:"14:00", end:"23:00" },
+};
+const REQ: Record<number,{total:number;chief:number;sub:number;training:number;welcome:number}> = {
+  1:{total:4,  chief:0, sub:0, training:0, welcome:0},
+  2:{total:12, chief:1, sub:1, training:1, welcome:2},
+  3:{total:12, chief:1, sub:1, training:1, welcome:2},
+  4:{total:10, chief:1, sub:1, training:1, welcome:2},
+  5:{total:10, chief:1, sub:1, training:1, welcome:2},
+};
+const norm = (s:string) => {
+  const x = (s||"").trim();
+  if (/チーフ/i.test(x)) return "チーフ";
+  if (/サブチーフ/i.test(x)) return "サブチーフ";
+  if (/(トレーニング|トレーニー)/i.test(x)) return "トレーニング";
+  if (/ウェルカム/i.test(x)) return "ウェルカム";
+  if (/ベーシック/i.test(x)) return "ベーシック";
+  if (/研修生/i.test(x)) return "研修生";
+  if (/ヘルプ/i.test(x)) return "ヘルプ";
+  if (/タイミー/i.test(x)) return "タイミー";
+  return x || "未設定";
+};
+const overlaps = (aS:string,aE:string,bS:string,bE:string)=> aS<bE && bS<aE;
+
+export async function POST(req:Request){
+  try{
+    const { date, slot } = await req.json() as {date?:string; slot?: "06-14"|"14-23"};
+    const day = (date && /^\d{4}-\d{2}-\d{2}$/.test(date)) ? date : new Date().toISOString().slice(0,10);
+    const sl  = (slot && SLOT[slot]) ? slot : "06-14";
+    const { start, end } = SLOT[sl];
+
+    await prisma.assignment.deleteMany({ where:{ date:new Date(`${day}T00:00:00`), shift_slot: sl } });
+
+    const shifts = await prisma.dailyShift.findMany({
+      where:{ date: new Date(`${day}T00:00:00`) },
+      include:{ employee:true }
+    });
+    const workers = shifts
+      .filter(s=>overlaps(start,end,s.start_time,s.end_time))
+      .map(s=>({ id:s.employee.employee_id, name:s.employee.employee_name, lic: norm(s.employee.license) }));
+
+    const unique = new Map(workers.map(w=>[w.id,w]));
+    const people = Array.from(unique.values());
+    if (!people.length) return NextResponse.json({ ok:false, warnings:["出勤者がいません"], result:[] }, { status:400 });
+
+    const buckets = {
+      chief: people.filter(w=>w.lic==="チーフ"),
+      sub: people.filter(w=>w.lic==="サブチーフ"),
+      training: people.filter(w=>w.lic==="トレーニング"),
+      welcome: people.filter(w=>w.lic==="ウェルカム"),
+      basic: people.filter(w=>w.lic==="ベーシック"),
+      trainee: people.filter(w=>w.lic==="研修生"),
+      help: people.filter(w=>w.lic==="ヘルプ"),
+      timee: people.filter(w=>w.lic==="タイミー"),
+      other: people.filter(w=>!["チーフ","サブチーフ","トレーニング","ウェルカム","ベーシック","研修生","ヘルプ","タイミー"].includes(w.lic)),
+    };
+    const assigned = new Set<string>();
+    const byFloor: Record<number, typeof people> = {1:[],2:[],3:[],4:[],5:[]};
+    const W: string[] = [];
+
+    // 役職（2F..5F）チーフ→サブ→トレーニング
+    const roleOrder: [keyof typeof buckets, keyof typeof REQ[2]][] = [["chief","chief"],["sub","sub"],["training","training"]];
+    for (const [key, needKey] of roleOrder){
+      for (const f of [2,3,4,5]){
+        const need = REQ[f][needKey as "chief"|"sub"|"training"];
+        for (let i=0;i<need;i++){
+          const pool = buckets[key].filter(w=>!assigned.has(w.id));
+          if (!pool.length){ W.push(`${f}階：${key.toUpperCase()}不足`); break; }
+          const pick = pool.shift()!;
+          assigned.add(pick.id); byFloor[f].push(pick);
+        }
+      }
+    }
+    // ウェルカム 2名×(2..5F)
+    for (const f of [2,3,4,5]){
+      for (let i=0;i<REQ[f].welcome;i++){
+        const pool = buckets.welcome.filter(w=>!assigned.has(w.id));
+        if (!pool.length){ W.push(`${f}階：ウェルカム不足`); break; }
+        const pick = pool.shift()!;
+        assigned.add(pick.id); byFloor[f].push(pick);
+      }
+    }
+    // 1F=4名（未割当ウェルカム優先、研修生は除外）
+    {
+      const need = REQ[1].total;
+      const pref = buckets.welcome.filter(w=>!assigned.has(w.id));
+      const rest = people.filter(w=>!assigned.has(w.id) && w.lic!=="研修生");
+      const chosen = [...pref, ...rest].slice(0,need);
+      chosen.forEach(c=>{ assigned.add(c.id); byFloor[1].push(c); });
+      if (byFloor[1].length<need) W.push(`1階：人数不足（${byFloor[1].length}/${need}）`);
+    }
+    // 研修生を2F/3Fに交互（人数カウント外）
+    {
+      const tr = buckets.trainee.filter(w=>!assigned.has(w.id));
+      let tgt = 2;
+      for (const t of tr){ byFloor[tgt].push(t); assigned.add(t.id); tgt = (tgt===2)?3:2; }
+    }
+    // 残りで不足補充（2..5F）
+    const filler = [...buckets.basic, ...buckets.welcome, ...buckets.help, ...buckets.timee, ...buckets.other]
+      .filter(w=>!assigned.has(w.id));
+    for (const f of [2,3,4,5]){
+      const cap = REQ[f].total;
+      while (byFloor[f].filter(x=>x.lic!=="研修生").length < cap && filler.length){
+        const pick = filler.shift()!;
+        assigned.add(pick.id); byFloor[f].push(pick);
+      }
+      const core = byFloor[f].filter(x=>x.lic!=="研修生").length;
+      if (core < cap) W.push(`${f}階：人数不足（${core}/${cap}）`);
+    }
+
+    // 保存
+    const rows = [1,2,3,4,5].flatMap(f=> byFloor[f].map(m=>({
+      date: new Date(`${day}T00:00:00`), shift_slot: sl, floor:f, employee_id:m.id
+    })));
+    if (rows.length) await prisma.assignment.createMany({ data: rows });
+
+    return NextResponse.json({
+      ok:true, date:day, slot:sl, warnings:W,
+      result: [1,2,3,4,5].map(f=>({ floor:f, members: byFloor[f] }))
+    });
+  }catch(e:any){
+    return NextResponse.json({ ok:false, error:e.message }, { status:500 });
+  }
+}
+import { NextResponse } from "next/server";
+import { prisma } from "../../../lib/prisma";
+
+const SLOT: Record<string,{start:string,end:string}> = {
+  "06-14": { start:"06:00", end:"14:00" },
+  "14-23": { start:"14:00", end:"23:00" },
+};
+const REQ: Record<number,{total:number;chief:number;sub:number;training:number;welcome:number}> = {
+  1:{total:4,  chief:0, sub:0, training:0, welcome:0},
+  2:{total:12, chief:1, sub:1, training:1, welcome:2},
+  3:{total:12, chief:1, sub:1, training:1, welcome:2},
+  4:{total:10, chief:1, sub:1, training:1, welcome:2},
+  5:{total:10, chief:1, sub:1, training:1, welcome:2},
+};
+const norm = (s:string) => {
+  const x = (s||"").trim();
+  if (/チーフ/i.test(x)) return "チーフ";
+  if (/サブチーフ/i.test(x)) return "サブチーフ";
+  if (/(トレーニング|トレーニー)/i.test(x)) return "トレーニング";
+  if (/ウェルカム/i.test(x)) return "ウェルカム";
+  if (/ベーシック/i.test(x)) return "ベーシック";
+  if (/研修生/i.test(x)) return "研修生";
+  if (/ヘルプ/i.test(x)) return "ヘルプ";
+  if (/タイミー/i.test(x)) return "タイミー";
+  return x || "未設定";
+};
+const overlaps = (aS:string,aE:string,bS:string,bE:string)=> aS<bE && bS<aE;
+
+export async function POST(req:Request){
+  try{
+    const { date, slot } = await req.json() as {date?:string; slot?: "06-14"|"14-23"};
+    const day = (date && /^\d{4}-\d{2}-\d{2}$/.test(date)) ? date : new Date().toISOString().slice(0,10);
+    const sl  = (slot && SLOT[slot]) ? slot : "06-14";
+    const { start, end } = SLOT[sl];
+
+    await prisma.assignment.deleteMany({ where:{ date:new Date(`${day}T00:00:00`), shift_slot: sl } });
+
+    const shifts = await prisma.dailyShift.findMany({
+      where:{ date: new Date(`${day}T00:00:00`) },
+      include:{ employee:true }
+    });
+    const workers = shifts
+      .filter(s=>overlaps(start,end,s.start_time,s.end_time))
+      .map(s=>({ id:s.employee.employee_id, name:s.employee.employee_name, lic: norm(s.employee.license) }));
+
+    const unique = new Map(workers.map(w=>[w.id,w]));
+    const people = Array.from(unique.values());
+    if (!people.length) return NextResponse.json({ ok:false, warnings:["出勤者がいません"], result:[] }, { status:400 });
+
+    const buckets = {
+      chief: people.filter(w=>w.lic==="チーフ"),
+      sub: people.filter(w=>w.lic==="サブチーフ"),
+      training: people.filter(w=>w.lic==="トレーニング"),
+      welcome: people.filter(w=>w.lic==="ウェルカム"),
+      basic: people.filter(w=>w.lic==="ベーシック"),
+      trainee: people.filter(w=>w.lic==="研修生"),
+      help: people.filter(w=>w.lic==="ヘルプ"),
+      timee: people.filter(w=>w.lic==="タイミー"),
+      other: people.filter(w=>!["チーフ","サブチーフ","トレーニング","ウェルカム","ベーシック","研修生","ヘルプ","タイミー"].includes(w.lic)),
+    };
+    const assigned = new Set<string>();
+    const byFloor: Record<number, typeof people> = {1:[],2:[],3:[],4:[],5:[]};
+    const W: string[] = [];
+
+    // 役職（2F..5F）チーフ→サブ→トレーニング
+    const roleOrder: [keyof typeof buckets, keyof typeof REQ[2]][] = [["chief","chief"],["sub","sub"],["training","training"]];
+    for (const [key, needKey] of roleOrder){
+      for (const f of [2,3,4,5]){
+        const need = REQ[f][needKey as "chief"|"sub"|"training"];
+        for (let i=0;i<need;i++){
+          const pool = buckets[key].filter(w=>!assigned.has(w.id));
+          if (!pool.length){ W.push(`${f}階：${key.toUpperCase()}不足`); break; }
+          const pick = pool.shift()!;
+          assigned.add(pick.id); byFloor[f].push(pick);
+        }
+      }
+    }
+    // ウェルカム 2名×(2..5F)
+    for (const f of [2,3,4,5]){
+      for (let i=0;i<REQ[f].welcome;i++){
+        const pool = buckets.welcome.filter(w=>!assigned.has(w.id));
+        if (!pool.length){ W.push(`${f}階：ウェルカム不足`); break; }
+        const pick = pool.shift()!;
+        assigned.add(pick.id); byFloor[f].push(pick);
+      }
+    }
+    // 1F=4名（未割当ウェルカム優先、研修生は除外）
+    {
+      const need = REQ[1].total;
+      const pref = buckets.welcome.filter(w=>!assigned.has(w.id));
+      const rest = people.filter(w=>!assigned.has(w.id) && w.lic!=="研修生");
+      const chosen = [...pref, ...rest].slice(0,need);
+      chosen.forEach(c=>{ assigned.add(c.id); byFloor[1].push(c); });
+      if (byFloor[1].length<need) W.push(`1階：人数不足（${byFloor[1].length}/${need}）`);
+    }
+    // 研修生を2F/3Fに交互（人数カウント外）
+    {
+      const tr = buckets.trainee.filter(w=>!assigned.has(w.id));
+      let tgt = 2;
+      for (const t of tr){ byFloor[tgt].push(t); assigned.add(t.id); tgt = (tgt===2)?3:2; }
+    }
+    // 残りで不足補充（2..5F）
+    const filler = [...buckets.basic, ...buckets.welcome, ...buckets.help, ...buckets.timee, ...buckets.other]
+      .filter(w=>!assigned.has(w.id));
+    for (const f of [2,3,4,5]){
+      const cap = REQ[f].total;
+      while (byFloor[f].filter(x=>x.lic!=="研修生").length < cap && filler.length){
+        const pick = filler.shift()!;
+        assigned.add(pick.id); byFloor[f].push(pick);
+      }
+      const core = byFloor[f].filter(x=>x.lic!=="研修生").length;
+      if (core < cap) W.push(`${f}階：人数不足（${core}/${cap}）`);
+    }
+
+    // 保存
+    const rows = [1,2,3,4,5].flatMap(f=> byFloor[f].map(m=>({
+      date: new Date(`${day}T00:00:00`), shift_slot: sl, floor:f, employee_id:m.id
+    })));
+    if (rows.length) await prisma.assignment.createMany({ data: rows });
+
+    return NextResponse.json({
+      ok:true, date:day, slot:sl, warnings:W,
+      result: [1,2,3,4,5].map(f=>({ floor:f, members: byFloor[f] }))
+    });
+  }catch(e:any){
+    return NextResponse.json({ ok:false, error:e.message }, { status:500 });
+  }
+}

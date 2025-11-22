@@ -1,0 +1,30 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// 従業員マスタ
+model Employee {
+  employee_id   String   @id
+  employee_name String
+  license       String   @default("未設定")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+// 日次の出勤リスト（Excel から取り込む先）
+model DailyShift {
+  id        Int      @id @default(autoincrement())
+  date      DateTime
+  shiftSlot String
+  staffName String
+  startTime String
+  endTime   String
+  createdAt DateTime @default(now())
+}
