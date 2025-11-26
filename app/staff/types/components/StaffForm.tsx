@@ -1,6 +1,23 @@
 "use client";
 import { useState, FormEvent } from "react";
-import type { License, Staff } from "@/types/staff";
+
+export type License =
+  | "チーフ"
+  | "サブチーフ"
+  | "トレーニング"
+  | "ウェルカム"
+  | "ベーシック"
+  | "トレーニー"
+  | "研修生"
+  | "ヘルプ"
+  | "タイミー";
+
+export type Staff = {
+  id: string;
+  name: string;
+  license: License;
+};
+
 
 const LICENSES: License[] = [
   "チーフ","サブチーフ","トレーニング","ウェルカム",
